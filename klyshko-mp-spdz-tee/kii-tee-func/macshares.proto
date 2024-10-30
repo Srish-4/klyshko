@@ -1,0 +1,7 @@
+syntax = "proto3";  // Specify the proto version
+
+// Message representing MAC shares
+message secret_share {
+    string mackeyshare_2 = 1;    // MAC key share 2
+    string mackeyshare_p = 2;     // MAC key share P         
+}
