@@ -1,54 +1,6 @@
-/* SPDX-License-Identifier: Apache-2.0 */
-/* Copyright (C) 2006-2015, ARM Limited, All Rights Reserved
- *               2020, Intel Labs
- */
-
-/*
- * SSL client demonstration program (with RA-TLS).
- * This program is originally based on an mbedTLS example ssl_client1.c but uses RA-TLS flows (SGX
- * Remote Attestation flows) if RA-TLS library is required by user.
- * Note that this program builds against mbedTLS 3.x.
- */
-
-#include <assert.h>
-#include <ctype.h>
-#include <dlfcn.h>
-#include <errno.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "mbedtls/build_info.h"
-
-//***$$$***
-#include <unistd.h>  // For sleep() function
-
-#include "macshares.pb-c.h"
-
-//***$$$***
-
-#define mbedtls_fprintf fprintf
-#define mbedtls_printf  printf
-
-#define MBEDTLS_EXIT_SUCCESS EXIT_SUCCESS
-#define MBEDTLS_EXIT_FAILURE EXIT_FAILURE
-#define RETRY_DELAY          1
-
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/debug.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/error.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/ssl.h"
-#include "ra_tls.h"
-
-//***$$$***
-#define HTTP_RESPONSE                                    \
-    "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n" \
-    "<h2>mbed TLS Test Server</h2>\r\n"                  \
-    "<p>Successful connection using: %s</p>\r\n"
-//***$$$***
+#include "vars.h"
+#define MAC_KEY_SHARE_P_PATH "etc/kii/secret-params/mac_key_share_p"
+#define MAC_KEY_SHARE_2_PATH "etc/kii/secret-params/mac_key_share_2"
 
 /* RA-TLS: on client, only need to register ra_tls_verify_callback_extended_der() for cert
  * verification. */
@@ -59,14 +11,6 @@ int (*ra_tls_verify_callback_extended_der_f)(uint8_t* der_crt, size_t der_crt_si
 void (*ra_tls_set_measurement_callback_f)(int (*f_cb)(const char* mrenclave, const char* mrsigner,
                                                       const char* isv_prod_id,
                                                       const char* isv_svn));
-
-                                                      
-
-#define SERVER_PORT "4433"
-#define SERVER_NAME "localhost"
-#define GET_REQUEST "GET / HTTP/1.0\r\n\r\n"
-
-#define DEBUG_LEVEL 0
 
 static void my_debug(void* ctx, int level, const char* file, int line, const char* str) {
     ((void)level);
@@ -135,7 +79,45 @@ static int my_verify_callback(void* data, mbedtls_x509_crt* crt, int depth, uint
                                                  (struct ra_tls_verify_callback_results*)data);
 }
 
+void read_file(const char* file_path, char** buffer) {
+    FILE* file = fopen(file_path, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Could not open file %s\n", file_path);
+        exit(EXIT_FAILURE);
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    if (file_size < 0) {
+        fprintf(stderr, "Error: Failed to determine file size for %s\n", file_path);
+        fclose(file);
+        exit(EXIT_FAILURE);
+    }
+    rewind(file);
+
+    *buffer = (char*)malloc(file_size + 1);
+    if (!*buffer) {
+        fprintf(stderr, "Error: Memory allocation failed for file buffer\n");
+        fclose(file);
+        exit(EXIT_FAILURE);
+    }
+
+    size_t bytes_read = fread(*buffer, 1, file_size, file);
+    if (bytes_read != file_size) {
+        fprintf(stderr,
+                "Error: Could not read the full file %s (expected %ld bytes, got %zu bytes)\n",
+                file_path, file_size, bytes_read);
+        free(*buffer);
+        fclose(file);
+        exit(EXIT_FAILURE);
+    }
+
+    (*buffer)[file_size] = '\0';  // Null-terminate the buffer
+    fclose(file);
+}
+
 int main(int argc, char** argv) {
+    printf("Inside KII.c\n");
     int ret;
     size_t len;
     int exit_code = MBEDTLS_EXIT_FAILURE;
@@ -155,6 +137,16 @@ int main(int argc, char** argv) {
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
 
+    char* b_port  = getenv("BASE_PORT");
+    int base_port = b_port ? atoi(b_port) : 0;
+
+    char* current_player_number = argv[5];
+    int player_number_defined   = current_player_number ? atoi(current_player_number) : 0;
+
+    int server_port = base_port + player_number_defined;
+    char server_port_str[6];  // Assuming port numbers are within 5 digits
+    snprintf(server_port_str, sizeof(server_port_str), "%d", server_port);
+
 #if defined(MBEDTLS_DEBUG_C)
     mbedtls_debug_set_threshold(DEBUG_LEVEL);
 #endif
@@ -164,6 +156,14 @@ int main(int argc, char** argv) {
     mbedtls_ssl_config_init(&conf);
     mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_entropy_init(&entropy);
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO) || defined(MBEDTLS_SSL_PROTO_TLS1_3)
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        mbedtls_printf("Failed to initialize PSA Crypto implementation: %d\n", (int)status);
+        return 1;
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO || MBEDTLS_SSL_PROTO_TLS1_3 */
 
     ra_tls_verify_lib = dlopen("libra_tls_verify_dcap_gramine.so", RTLD_LAZY);
     if (!ra_tls_verify_lib) {
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     }
 
     if (argc > 2 && ra_tls_verify_lib) {
-        if (argc != 5) {
+        if (argc != 6) {
             mbedtls_printf(
                 "USAGE: %s %s <expected mrenclave> <expected mrsigner>"
                 " <expected isv_prod_id> <expected isv_svn>\n"
@@ -274,11 +274,11 @@ int main(int argc, char** argv) {
 
     mbedtls_printf(" ok\n");
 
-    mbedtls_printf("  . Connecting to tcp/%s/%s...", SERVER_NAME, SERVER_PORT);
+    mbedtls_printf("  . Connecting to tcp/%s/%s...", SERVER_NAME, server_port_str);
     fflush(stdout);
 
     while (1) {
-        ret = mbedtls_net_connect(&server_fd, SERVER_NAME, SERVER_PORT, MBEDTLS_NET_PROTO_TCP);
+        ret = mbedtls_net_connect(&server_fd, SERVER_NAME, server_port_str, MBEDTLS_NET_PROTO_TCP);
         if (ret == 0)
             break;
         else {
@@ -384,10 +384,20 @@ int main(int argc, char** argv) {
 
     // PROTO BUFF STARTING
     // code for packing the macshares and sending over the TLS dconnection again to the server
-    SecretShare message   = SECRET_SHARE__INIT;
-    message.mackeyshare_2 = "f0cf6099e629fd0bda2de3f9515ab72b";
-    message.mackeyshare_p = "-88222337191559387830816715872691188861";
-    unsigned length       = secret_share__get_packed_size(&message);
+    SecretShare message = SECRET_SHARE__INIT;
+    char* macKeyShare_p = NULL;
+    char* macKeyShare_2 = NULL;
+
+    // Read macKeyShare_p
+    read_file(MAC_KEY_SHARE_P_PATH, &macKeyShare_p);
+
+    // Read macKeyShare_2
+    read_file(MAC_KEY_SHARE_2_PATH, &macKeyShare_2);
+    message.mackeyshare_p = macKeyShare_p;
+    message.mackeyshare_2 = macKeyShare_2;
+    // message.mackeyshare_2 = "f0cf6099e629fd0bda2de3f9515ab72b"; //removed the hardcoding of the
+    // shares message.mackeyshare_p = "-88222337191559387830816715872691188861";
+    unsigned length = secret_share__get_packed_size(&message);
 
     if (length == 0) {
         fprintf(stderr, "packing or serialization error");
@@ -427,6 +437,11 @@ exit:
         mbedtls_printf("Last error was: %d - %s\n\n", ret, error_buf);
     }
 #endif
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO) || defined(MBEDTLS_SSL_PROTO_TLS1_3)
+    mbedtls_psa_crypto_free();
+#endif /* MBEDTLS_USE_PSA_CRYPTO || MBEDTLS_SSL_PROTO_TLS1_3 */
+
     if (ra_tls_verify_lib)
         dlclose(ra_tls_verify_lib);
 
